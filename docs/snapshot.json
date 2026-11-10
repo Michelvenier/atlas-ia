@@ -1,0 +1,18 @@
+{
+  "as_of": null,
+  "market_open": false,
+  "feed": "Sin conexión: pendiente de configurar Supabase y ejecutar GitHub Actions",
+  "cash_ars": 10000000,
+  "cash_usd": 0,
+  "initial_ars": 10000000,
+  "autonomy_enabled": false,
+  "trading_enabled": false,
+  "allocations": [
+    {"profile":"conservador","target_pct":60},
+    {"profile":"moderado","target_pct":25},
+    {"profile":"agresivo","target_pct":15}
+  ],
+  "positions": [],"orders":[],"decisions":[],"audit":[],"news":[],"analyses":[],
+  "warnings": [{"status":"NO_DESPLEGADO","note":"Ejemplo inicial. No existe conexión activa al proyecto Supabase."}],
+  "note":"Datos iniciales de configuración, no extraídos de Supabase."
+}
