@@ -1,0 +1,47 @@
+name: ATLAS IA - simulacion bursatil
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '30 8 * * 1-5'
+      timezone: 'America/Argentina/Buenos_Aires'
+    - cron: '0 10 * * 1-5'
+      timezone: 'America/Argentina/Buenos_Aires'
+    - cron: '7,22,37,52 10-18 * * 1-5'
+      timezone: 'America/Argentina/Buenos_Aires'
+    - cron: '15 19 * * 1-5'
+      timezone: 'America/Argentina/Buenos_Aires'
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency:
+  group: atlas-simulation
+  cancel-in-progress: false
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Ejecutar motor ficticio
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+        run: python -m app.engine
+      - name: Configurar GitHub Pages
+        uses: actions/configure-pages@v5
+      - name: Preparar sitio
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+      - name: Publicar sitio
+        id: deploy
+        uses: actions/deploy-pages@v4
