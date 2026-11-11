@@ -1,50 +1,24 @@
-# ATLAS IA V4 — Publicación sobre el mismo GitHub y Supabase
+# Cómo actualizar ATLAS V5 sin reemplazar todo el proyecto
 
-No se reinicia la cartera. No se cambian las contraseñas. No se conecta ningún broker.
-
-## Paso 1: Supabase (obligatorio antes de GitHub)
-
-1. Abrí Supabase → proyecto `atlas-ia` → SQL Editor → New query.
-2. Abrí `sql/03_motor_fci_y_estadisticas.sql` con Bloc de notas y pegá TODO el código en SQL Editor.
-3. Pulsá Run. Si hay error, NO pases al paso 2: hacé una captura del error (sin claves).
-4. No vuelvas a ejecutar los archivos 01 y 02; no vuelvas a inicializar los $10 millones.
-
-La migración crea tablas `atlas_nav_intents`, `atlas_equity_history` y función segura `atlas_apply_nav_paper_fill` para simular una suscripción/rescate de FCI con VCP de fecha posterior a la orden.
-
-## Paso 2: GitHub
-
-1. Abrí https://github.com/Michelvenier/atlas-ia
-2. `Add file` → `Upload files`.
-3. Descomprimí `ATLAS_IA_MOTOR_AUTONOMO_V4_GITHUB.zip` y subí el contenido de las carpetas `app`, `docs`, `tests` y el archivo README si lo deseás. Las rutas finales deben ser:
+1. **Antes de GitHub**, en Supabase > proyecto atlas-ia > SQL Editor > New query, ejecutar **todo** el contenido de `sql/04_plazos_fijos_ficticios.sql`. Solo este SQL; no repetir 01, 02 ni 03. No poner contraseñas en el chat.
+2. En el repositorio `https://github.com/Michelvenier/atlas-ia` actualizar las rutas exactamente:
    - `app/engine.py` (reemplazar)
-   - `app/conservative.py` (nuevo)
+   - `app/conservative.py` (reemplazar)
+   - `app/term_deposit.py` (agregar)
    - `docs/index.html` (reemplazar)
-   - `tests/test_conservative.py` (nuevo)
-   - `sql/03_motor_fci_y_estadisticas.sql` (agregar al repositorio)
-4. Confirmá `Commit changes` en `main`.
-5. **No subas claves, contraseñas ni archivos `.env`.**
+   - `sql/04_plazos_fijos_ficticios.sql` (agregar al repositorio para registro)
+   - `tests/test_active.py` (opcional)
+   No modificar `.github/workflows/atlas.yml`, ni los secretos, ni la base de datos original.
+3. Hacer commit en rama `main`, luego `Actions > ATLAS IA - simulacion bursatil > Run workflow > main`.
+4. Abrir trabajo `run` > `Ejecutar motor ficticio`. Buscar `term_deposit_status`, `conservative_status`, `warnings`.
+5. En Supabase, ejecutar la consulta de comprobación:
 
-## Paso 3: arrancar un ciclo autónomo y verificar
+```sql
+select id,bank,principal,tea_pct,started_at,maturity_at,status
+from public.atlas_term_deposits order by started_at desc limit 10;
+```
 
-1. Abrí https://github.com/Michelvenier/atlas-ia/actions/workflows/atlas.yml
-2. `Run workflow` → `main` → `Run workflow`.
-3. Abrí la ejecución nueva → `run` → `Ejecutar motor ficticio`.
-4. Tiene que verse un resumen con `conservative_status`, `byma_open`, `news_refreshed` y `warnings`.
-5. Un verde significa que **el código funcionó**, no que se haya comprado. La primera suscripción FCI debe quedar `PENDING` hasta publicarse un VCP de una fecha posterior.
-6. Entrá a https://michelvenier.github.io/atlas-ia/ y verificá la nueva pestaña **Evolución ARS / USD** y el panel **Estado del perfil conservador**.
+6. Confirmar una fila `ACTIVE` solamente si la API oficial reportó una TEA y el motor creó el depósito. Si no se creó, el motivo debe aparecer en `term_deposit_status` y `CONSERVATIVE_REVIEW` de la Auditoría. **No forzar números de tasas ni confirmar como ejecutado un producto que no se pudo simular.**
+7. Abrir `https://michelvenier.github.io/atlas-ia/` y recargar con Ctrl+F5. Aparece panel `Alternativa conservadora: plazo fijo` y el detalle en la cartera.
 
-## Qué opera y qué NO opera
-
-- **Conservador:** compras y rescates ficticios de clases MM en ARS con fecha NAV posterior; hasta $400.000 por orden y máximo $1,2M por clase / cinco sociedades administradoras, condicionado a fuentes y filtros. No hay acceso verificado a brokers ni horarios de suscripción de cada fondo.
-- **Moderado:** compra y venta ficticia de SPY.BA, MSFT.BA y AAPL.BA según reglas, calendario, límite y precio posterior (con restricciones por instrumento).
-- **Agresivo:** compra y venta ficticia de YPFD.BA, GGAL.BA y PAMP.BA según reglas y precio posterior.
-- **Bonos, letras, ON, cauciones y otros FCI:** disponibles para investigación, **no se autoriza su negociación automática** porque faltan reglas específicas de ejecución, liquidación y fuentes suficientes.
-- **Comité:** presenta argumentos explicables por reglas; no existe todavía un grupo de agentes generativos conectado a balances y noticias para decidir órdenes.
-- **No garantiza ganancias**: los precios y los NAV provienen de terceros y las operaciones son simuladas, no negociaciones confirmadas. Se preservan fondos cuando no hay datos válidos.
-
-## Fuentes utilizadas
-
-- https://www.byma.com.ar/mercado/calendario-bursatil
-- https://compararfondos.com.ar/api.html
-- https://www.cnv.gov.ar/SitioWeb/FondosComunesInversion/CuotaPartes
-- https://ar.dolarapi.com/docs/argentina/operations/get-dolar-bolsa
+Una prueba local de funciones no equivale a una operación real en tu Supabase. La operación autónoma debe verificarse con los registros persistentes del servidor y su próxima ejecución programada.

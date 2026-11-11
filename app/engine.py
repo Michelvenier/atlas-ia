@@ -12,6 +12,7 @@ import pandas as pd
 import exchange_calendars as xc
 from .research import dynamic_catalog, local_watch_catalog, decision_committee
 from .conservative import selected_funds, nav_quote_timestamp, conservative_window, NAV_SOURCE
+from .term_deposit import fetch_offer
 
 TZ=ZoneInfo('America/Argentina/Buenos_Aires'); UTC=dt.timezone.utc
 ROOT=Path(__file__).resolve().parents[1]
@@ -21,17 +22,23 @@ UNIVERSE={
  'SPY.BA':('SPY CEDEAR','cedear','moderado',0.28),
  'MSFT.BA':('Microsoft CEDEAR','cedear','moderado',0.28),
  'AAPL.BA':('Apple CEDEAR','cedear','moderado',0.28),
+ 'KO.BA':('Coca-Cola CEDEAR','cedear','moderado',0.32),
+ 'JNJ.BA':('Johnson & Johnson CEDEAR','cedear','moderado',0.32),
+ 'BYMA.BA':('Bolsas y Mercados Argentinos','accion','moderado',0.38),
  'YPFD.BA':('YPF','accion','agresivo',0.48),
  'GGAL.BA':('Galicia','accion','agresivo',0.48),
  'PAMP.BA':('Pampa Energía','accion','agresivo',0.48),
+ 'BMA.BA':('Banco Macro','accion','agresivo',0.48),
+ 'TGSU2.BA':('Transportadora de Gas del Sur','accion','agresivo',0.48),
+ 'NVDA.BA':('Nvidia CEDEAR','cedear','agresivo',0.60),
 }
-BUY_SCORE=78
-QUOTE_MAX_AGE_S=900
+BUY_SCORE=64  # entrada piloto gradual, no relajación de frescura/cotización
+QUOTE_MAX_AGE_S=2100  # Yahoo puede entregar 15-20 min de retraso; precios ficticios, no ejecutables
 FEE=0.005
 SLIPPAGE=0.002
 MAX_PER_EMITTER=0.08
 MAX_NEW_PER_RUN=1
-MAX_ORDER_BY_PROFILE={'conservador':400000,'moderado':300000,'agresivo':200000}
+MAX_ORDER_BY_PROFILE={'conservador':400000,'moderado':150000,'agresivo':100000}
 # Instrumentos adicionales para OBSERVACIÓN. No autorizan compras nuevas.
 WATCH_ONLY={
  'BMA.BA':('Banco Macro','XBUE','ARS','finanzas'),
@@ -249,6 +256,67 @@ def create_order(db,pid,ins,profile,side,qty,limit,reason,metrics,now):
  record_event(db,pid,'ORDER_PENDING',f'{side} {qty} {ins["symbol"]}: orden ficticia pendiente de observación posterior',{'limit':limit,'order':order['id']})
 
 
+def term_paper_cycle(db,pid,now,conservative_status,logs):
+ """Fallback autónomo: PF a 30 días si no hay FCI elegible ni intención pendiente.
+ No depende de rueda BYMA, pero sí de día/hora bancaria y TEA reciente del BCRA.
+ """
+ local=now.astimezone(TZ)
+ if local.weekday()>=5 or local.date().isoformat() in KNOWN_BYMA_CLOSED:
+  return 'Plazo fijo: fuera de día bancario habilitado'
+ if not (dt.time(11,0)<=local.time().replace(tzinfo=None)<dt.time(16,0)):
+  return 'Plazo fijo: fuera de ventana bancaria 11-16'
+ p=db.get('atlas_portfolios',code='eq.'+CODE)[0]
+ if not (p['autonomy_enabled'] and p['trading_enabled']):return 'Plazo fijo: autonomía deshabilitada'
+ if any(o['profile']=='conservador' for o in db.get('atlas_orders',portfolio_id='eq.'+pid,status='eq.PENDING')):
+  return 'Plazo fijo: FCI conservador pendiente, no duplicar compromiso'
+ if conservative_status.startswith('Orden FCI pendiente'):
+  return 'Plazo fijo: FCI priorizado en este ciclo'
+ try:
+  offer,reason=fetch_offer(now,200000)
+  if not offer:return 'Plazo fijo: '+str(reason)[:180]
+  res=db.rpc('atlas_open_paper_term',{'p_portfolio_id':pid,'p_bank':offer['bank'],
+   'p_product':offer['product'],'p_amount':200000,'p_tea':offer['tea'],
+   'p_rate_date':offer['rate_date'],'p_source':offer['source'],'p_restrictions':offer['restrictions']})
+  if res.get('ok'):
+   return f"Plazo fijo FICTICIO registrado: $200.000, {offer['bank']}, TEA {offer['tea']}%, vence a 30 días; no implica alta bancaria real"
+  return 'Plazo fijo no constituido: '+str(res.get('reason'))[:160]
+ except Exception as exc:
+  logs.append({'term_deposit_error':str(exc)[:180]})
+  return 'Plazo fijo: error de consulta BCRA/RPC; sin operación'
+
+
+def evaluate_past_signals(db,pid,now,quotes,logs):
+ """Log 5/20-day outcome; avoid overfitting by NOT changing parameters automatically.
+ Only signals with stored baseline prices and a later observable price are scored.
+ """
+ try:
+  decisions=db.get('atlas_decisions',portfolio_id='eq.'+pid,order='decided_at.desc',limit='200')
+  instrument_map={i['id']:i['symbol'] for i in db.get('atlas_instruments',exchange='eq.XBUE')}
+  for d in decisions:
+   if d.get('action') not in ('comprar','vender'):continue
+   sym=instrument_map.get(d['instrument_id']);q=quotes.get(sym)
+   if not sym or not q:continue
+   base=as_float((d.get('risk_checks') or {}).get('last_close'))
+   if base<=0:continue
+   age=(now-ts_parse(d['decided_at'])).days
+   if age<5:continue
+   observed=q[-1][1]
+   # A review must be measured AFTER the decision at the first eligible review cycle.
+   if q[-1][0] <= ts_parse(d['decided_at']):continue
+   for horizon in (5,20):
+    if age<horizon:continue
+    old=db.get('atlas_signal_outcomes',decision_id='eq.'+d['id'],horizon_days='eq.'+str(horizon),limit='1')
+    if old:continue
+    change=100*(observed/base-1)
+    correct=(change>0) if d['action']=='comprar' else (change<0)
+    db.insert('atlas_signal_outcomes',{'decision_id':d['id'],'horizon_days':horizon,
+      'observed_at':q[-1][0].isoformat(),'baseline_price':base,'observed_price':observed,
+      'return_pct':round(change,6),'direction_correct':correct})
+    record_event(db,pid,'SIGNAL_OUTCOME',f"Resultado {horizon} días: {sym}; {d['action']}; retorno de precio {change:.2f}%; {'acierto' if correct else 'error'}",
+      {'decision_id':d['id'],'horizon_days':horizon,'source':'Yahoo Finance; cotización informativa; no rendimiento neto'})
+ except Exception as exc:logs.append({'learning_error':str(exc)[:180]})
+
+
 def mep_quote(now):
  """For valuation only: never authorizes USD trades."""
  try:
@@ -326,12 +394,12 @@ def consider_nav_subscription(db,pid,now,funds,market_open,logs):
  positions=[(k,v) for k,v in pos.items() if k[1]=='conservador' and as_float(v['quantity'])>0]
  committed=sum(as_float(x['quantity'])*as_float(x['average_cost']) for _,x in positions)
  pending=db.get('atlas_orders',portfolio_id='eq.'+pid,status='eq.PENDING')
- if pending:return 'Hay órdenes pendientes; se evita comprometer saldo dos veces'
+ if any(x.get('profile')=='conservador' for x in pending):return 'Hay suscripción/rescate conservador pendiente; no se duplica' 
  if committed>=max_budget:return 'Perfil conservador ya alcanzó su asignación'
  if not funds:return 'No hay fondos de liquidez que superen los filtros verificables'
  # Fund NAV is never an executable order book. Buy max 400k, maintain liquidity.
  candidate_list=[x for x in funds.values() if x['info'].get('buy_eligible')]
- candidate_list.sort(key=lambda v:(-v['info']['r30'],v['info']['symbol']))
+ candidate_list.sort(key=lambda v:(-(v['info'].get('r30') if v['info'].get('r30') is not None else (v['info'].get('r7') or 0)),v['info']['symbol']))
  for candidate in candidate_list:
   f=candidate['info'];ins=candidate['instrument']
   invested_here=sum(as_float(v['quantity'])*as_float(v['average_cost']) for (iid,_),v in positions if iid==ins['id'])
@@ -424,6 +492,10 @@ def portfolio_valuation(db,pid,now,quotes,funds,mep,logs):
    unpriced.append(ins['symbol']);continue
   holdings+=qty*mark
  # Do NOT present missing valuations as accurate portfolio equity.
+ # Un plazo fijo no desaparece del patrimonio porque ya no es efectivo.
+ for term in db.get('atlas_term_deposits',portfolio_id='eq.'+pid,status='eq.ACTIVE'):
+  start=ts_parse(term['started_at']);days=max(0,min(30,(now-start).total_seconds()/86400))
+  holdings+=as_float(term['principal'])*(1+as_float(term['tea_pct'])/100)**(days/365)
  equity=round(cash+holdings,4) if not unpriced else None
  rate=mep.get('rate');usd=round(equity/rate,4) if rate and equity is not None else None
  try:
@@ -443,9 +515,11 @@ def portfolio_valuation(db,pid,now,quotes,funds,mep,logs):
 def run():
  db=DB();now=dt.datetime.now(UTC);local=now.astimezone(TZ)
  # A missing SQL migration is fatal, not an invisible SUCCESS with zero operations.
- try:db.get('atlas_nav_intents',limit='1');db.get('atlas_equity_history',limit='1')
- except Exception as ex:raise RuntimeError('Falta aplicar sql/03_motor_fci_y_estadisticas.sql en Supabase: '+str(ex)[:250]) from ex
+ try:db.get('atlas_nav_intents',limit='1');db.get('atlas_equity_history',limit='1');db.get('atlas_term_deposits',limit='1');db.get('atlas_signal_outcomes',limit='1')
+ except Exception as ex:raise RuntimeError('Faltan migraciones SQL 03 o 04 (plazos fijos): '+str(ex)[:250]) from ex
  port=db.get('atlas_portfolios',code='eq.'+CODE)[0];pid=port['id']
+ # Liquidar automáticamente los depósitos que ya alcanzaron su vencimiento real.
+ db.rpc('atlas_mature_paper_terms',{'p_portfolio_id':pid})
  db.insert('atlas_job_runs',{'job_name':'atlas_cloud_cycle','status':'RUNNING','details':{'at':iso_now()}})
  # Los datos de situación se exportan incluso si el mercado está cerrado.
  logs=[];quotes={};analyses=[]
@@ -463,6 +537,7 @@ def run():
   except Exception as ex:logs.append({'symbol':symbol,'error':'Histórico: '+str(ex)[:110]})
   try:quotes[symbol]=fetch_chart(symbol,'1m','1d')
   except Exception as ex:logs.append({'symbol':symbol,'error':'Intradiario: '+str(ex)[:110]})
+ evaluate_past_signals(db,pid,now,quotes,logs)
  funds,local_fci_open=store_nav_observations(db,now,market_open,logs)
  if port['autonomy_enabled'] and port['trading_enabled']:
   fill_pending_nav(db,pid,now,funds,logs)
@@ -516,9 +591,15 @@ def run():
    allocs={x['profile']:as_float(x['target_pct'])/100 for x in db.get('atlas_allocations',portfolio_id='eq.'+pid)}
    instruments={x['symbol']:x for x in db.get('atlas_instruments',exchange='eq.XBUE')}
    pending=db.get('atlas_orders',portfolio_id='eq.'+pid,status='eq.PENDING')
-   if not pending:
+   # Las órdenes pendientes de un perfil NO bloquean el análisis de otros perfiles.
+   pending_equity=[o for o in pending if o.get('profile') in ('moderado','agresivo')]
+   pending_profiles={o['profile'] for o in pending_equity}
+   if pending_equity:
+    record_event(db,pid,'EQUITY_PENDING', 'Operación accionaria pendiente de precio posterior; se evita duplicación', {'count':len(pending_equity)})
+   if True:
     # Primero salidas por pérdidas y ganancias; no supone ganancia por vender.
     for a in analyses:
+     if a['profile'] in pending_profiles:continue
      sym=a['symbol'];ins=instruments.get(sym);pos=positions.get((ins['id'],a['profile'])) if ins else None
      if not pos or as_float(pos['quantity'])<=0:continue
      ok,why=valid_intraday_quote(quotes.get(sym),now)
@@ -542,39 +623,59 @@ def run():
      # Solamente compras; el 60% conservador queda en efectivo, y nunca se usa USD sin MEP.
      for a in sorted(analyses,key=lambda x:x['metrics']['score'],reverse=True):
       sym=a['symbol'];p=a['profile'];ins=instruments.get(sym)
+      if p in pending_profiles:continue
       if not ins:continue
       q=quotes.get(sym);ok,why=valid_intraday_quote(q,now)
       if not ok:continue
       allowed,_=instrument_session_allowed(sym,now)
       if not allowed:continue
       score=a['metrics']['score'];rsi=a['metrics']['rsi'];vol=a['metrics']['vol']
-      if score<BUY_SCORE or not 38<=rsi<=66 or vol>UNIVERSE[sym][3]:continue
+      if score<BUY_SCORE or not 30<=rsi<=75 or vol>UNIVERSE[sym][3]:continue
       if (ins['id'],p) in positions and as_float(positions[(ins['id'],p)]['quantity'])>0:continue
       price=q[-1][1];budget=as_float(port['initial_cash'])*allocs.get(p,0)
       already=sum(as_float(v['quantity'])*as_float(v['average_cost']) for (iid,pf),v in positions.items() if pf==p)
       budget=min(budget,MAX_ORDER_BY_PROFILE[p],as_float(port['initial_cash'])*MAX_PER_EMITTER,as_float(port['cash_ars']),max(0,budget-already))
       qty=int(budget/(price*(1+FEE+SLIPPAGE+0.01)))
       if qty<=0:continue
-      create_order(db,pid,ins,p,'BUY',qty,price*(1+SLIPPAGE+0.01),f'Entrada técnica score {score}, RSI {rsi}, vol {vol:.2%}. Pendiente de precio posterior.',a['metrics'],now)
+      create_order(db,pid,ins,p,'BUY',qty,price*(1+SLIPPAGE+0.01),f'Entrada piloto gradual, límite ARS {MAX_ORDER_BY_PROFILE[p]}: score {score}, RSI {rsi}, vol {vol:.2%}. Cotización posterior obligatoria.',a['metrics'],now)
+      record_event(db,pid,'PILOT_ENTRY', f'Entrada piloto {p}: {sym}, {qty} títulos; pendiente de cotización posterior', {'score':score,'rsi':rsi})
       break
  else:
   logs.append({'session':'Sin rueda o fuera de sesión: sin órdenes nuevas ni fills'})
  conservative_status=consider_nav_redemption(db,pid,now,funds,logs)
  if not conservative_status:
   conservative_status=consider_nav_subscription(db,pid,now,funds,local_fci_open,logs)
- record_event(db,pid,'CONSERVATIVE_REVIEW',conservative_status,{'candidate_funds':len(funds)})
+ term_status=term_paper_cycle(db,pid,now,conservative_status,logs)
+ record_event(db,pid,'CONSERVATIVE_REVIEW',conservative_status,{'candidate_funds':len(funds),'eligible_funds':sum(bool(x['info'].get('buy_eligible')) for x in funds.values()),'term_deposit_status':term_status})
+ # Un proceso verde sin órdenes no equivale a inversión activa: se informa por qué.
+ if port.get('autonomy_enabled') and port.get('trading_enabled'):
+  active_orders=db.get('atlas_orders',portfolio_id='eq.'+pid,status='eq.PENDING')
+  if not active_orders:
+   diagnostics=[]
+   for a in analyses:
+    sym=a['symbol'];m=a['metrics'];ok,why=valid_intraday_quote(quotes.get(sym),now)
+    if not market_open: reason='SIN_RUEDA'
+    elif not ok: reason=why
+    elif not instrument_session_allowed(sym,now)[0]:reason=instrument_session_allowed(sym,now)[1]
+    elif m['score']<BUY_SCORE:reason='PUNTAJE_INSUFICIENTE'
+    elif not 30<=m['rsi']<=75:reason='RSI_FUERA_DE_RANGO'
+    elif m['vol']>UNIVERSE[sym][3]:reason='VOLATILIDAD_EXCESIVA'
+    else:reason='PRESUPUESTO_POSICION_O_DUPLICADO'
+    diagnostics.append({'symbol':sym,'reason':reason,'score':m['score']})
+   record_event(db,pid,'NO_TRADE_EXPLAINED','Sin órdenes nuevas: razones verificables por instrumento',{'details':diagnostics,'conservative':conservative_status})
+
  for item in logs[:12]:
   try:record_event(db,pid,'DATA_WARNING',json.dumps(item,ensure_ascii=False))
   except Exception:pass
  mep=mep_quote(now)
  valuation=portfolio_valuation(db,pid,now,quotes,funds,mep,logs)
- export_snapshot(db,now,market_open,logs,analyses,quotes,observed,news_count,broad_catalog,catalog_status,committee,valuation,conservative_status,funds)
+ export_snapshot(db,now,market_open,logs,analyses,quotes,observed,news_count,broad_catalog,catalog_status,committee,valuation,conservative_status,funds,term_status)
  jobs=db.get('atlas_job_runs',job_name='eq.atlas_cloud_cycle',order='id.desc',limit='1')
  if jobs:db.patch('atlas_job_runs',{'id':'eq.'+str(jobs[0]['id'])},{'finished_at':iso_now(),'status':'SUCCESS','details':{'market_open':market_open,'warnings':len(logs),'conservative':conservative_status[:100],'news_refreshed':news_count,'watch_count':len(observed),'catalog_count':len(broad_catalog)}})
- print(json.dumps({'byma_open':market_open,'local_tradable_analyses':len(analyses),'global_watch_analyses':len(observed),'news_refreshed':news_count,'catalog_count':len(broad_catalog),'warnings':len(logs),'conservative_status':conservative_status[:180]},ensure_ascii=False))
+ print(json.dumps({'byma_open':market_open,'local_tradable_analyses':len(analyses),'global_watch_analyses':len(observed),'news_refreshed':news_count,'catalog_count':len(broad_catalog),'warnings':len(logs),'conservative_status':conservative_status[:180],'term_deposit_status':term_status[:180]},ensure_ascii=False))
 
 
-def export_snapshot(db,now,market_open,logs,analyses,quotes,observed,news_count,broad_catalog,catalog_status,committee,valuation,conservative_status,funds):
+def export_snapshot(db,now,market_open,logs,analyses,quotes,observed,news_count,broad_catalog,catalog_status,committee,valuation,conservative_status,funds,term_status):
  p=db.get('atlas_portfolios',code='eq.'+CODE)[0];pid=p['id']
  positions=db.get('atlas_positions',portfolio_id='eq.'+pid)
  instruments=db.get('atlas_instruments')
@@ -591,7 +692,8 @@ def export_snapshot(db,now,market_open,logs,analyses,quotes,observed,news_count,
  news=db.get('atlas_news',order='published_at.desc',limit='300')
  allocations=db.get('atlas_allocations',portfolio_id='eq.'+pid)
  last_decisions=db.get('atlas_decisions',portfolio_id='eq.'+pid,order='decided_at.desc',limit='30')
- snapshot={'valuation':valuation,'conservative_status':conservative_status,'as_of':iso_now(),'market_open':market_open,'market_detail':{'XBUE':{'open':market_open,'local_time':now.astimezone(TZ).isoformat(),'reason':('Feriado confirmado en BYMA' if now.astimezone(TZ).date().isoformat() in KNOWN_BYMA_CLOSED else '11/11: rueda excepcional; CEDEAR T+1 no simulado, órdenes CEDEAR bloqueadas' if now.astimezone(TZ).date().isoformat() in SPECIAL_CEDEAR_T1_ONLY else 'Calendario local exchange_calendars; restricciones extraordinarias NO garantizadas'),'source':'exchange_calendars + excepciones fechadas'},'US':{'open':None,'reason':'Seguimiento de precios únicamente; no se verifica sesión para negociación automática'}},'news_fetched_this_cycle':news_count,'cycle_kind':('PREAPERTURA' if now.astimezone(TZ).time().hour<10 else 'CIERRE' if now.astimezone(TZ).time().hour>=18 else 'MONITOREO'), 'execution_policy':'FCI solo se simula con cuotaparte de fecha posterior; instrumentos bursátiles necesitan precio posterior. No se completa una orden sin precio intradiario posterior; CEDEAR 11/11 T+1 bloqueado si no se modela liquidación','instrument_catalog':broad_catalog,'catalog_status':catalog_status,'committee':committee,'watchlist':observed,'feed':'Yahoo Finance (no oficial; datos potencialmente demorados)','cash_ars':as_float(p['cash_ars']),'cash_usd':as_float(p['cash_usd']),'initial_ars':as_float(p['initial_cash']),'autonomy_enabled':p['autonomy_enabled'],'trading_enabled':p['trading_enabled'],'allocations':[{ 'profile':x['profile'],'target_pct':as_float(x['target_pct'])} for x in allocations],'positions':out,'orders':[{'status':x['status'],'side':x['side'],'quantity':as_float(x['quantity']),'limit_price':as_float(x['limit_price']),'placed_at':x['placed_at'],'symbol':symbol_by_id.get(x['instrument_id'],'?')} for x in orders],'decisions':[{'action':x['action'],'rationale':x['rationale'],'decided_at':x['decided_at'],'symbol':symbol_by_id.get(x['instrument_id'],'?')} for x in last_decisions],'audit':[{'type':x['event_type'],'message':x['message'],'at':x['occurred_at']} for x in audit],'news':[{'title':x['title'],'url':x['article_url'],'publisher':x['publisher'],'country':x['country'],'sector':x['sector'],'published_at':x.get('published_at')} for x in news],'analyses':analyses,'warnings':logs,'note':'Cartera ficticia; informe públicamente visible si GitHub Pages es público. Los fills son estimaciones, no transacciones reales.'}
+ terms=[{'bank':x['bank'],'principal':as_float(x['principal']),'tea_pct':as_float(x['tea_pct']), 'started_at':x['started_at'],'maturity_at':x['maturity_at'],'status':x['status'],'interest_paid':as_float(x['interest_paid'])} for x in db.get('atlas_term_deposits',portfolio_id='eq.'+pid,order='started_at.desc',limit='30')]
+ snapshot={'term_deposits':terms,'valuation':valuation,'conservative_status':conservative_status,'term_deposit_status':term_status,'as_of':iso_now(),'market_open':market_open,'market_detail':{'XBUE':{'open':market_open,'local_time':now.astimezone(TZ).isoformat(),'reason':('Feriado confirmado en BYMA' if now.astimezone(TZ).date().isoformat() in KNOWN_BYMA_CLOSED else '11/11: rueda excepcional; CEDEAR T+1 no simulado, órdenes CEDEAR bloqueadas' if now.astimezone(TZ).date().isoformat() in SPECIAL_CEDEAR_T1_ONLY else 'Calendario local exchange_calendars; restricciones extraordinarias NO garantizadas'),'source':'exchange_calendars + excepciones fechadas'},'US':{'open':None,'reason':'Seguimiento de precios únicamente; no se verifica sesión para negociación automática'}},'news_fetched_this_cycle':news_count,'cycle_kind':('PREAPERTURA' if now.astimezone(TZ).time().hour<10 else 'CIERRE' if now.astimezone(TZ).time().hour>=18 else 'MONITOREO'), 'execution_policy':'FCI solo se simula con cuotaparte de fecha posterior; instrumentos bursátiles necesitan precio posterior. No se completa una orden sin precio intradiario posterior; CEDEAR 11/11 T+1 bloqueado si no se modela liquidación','instrument_catalog':broad_catalog,'catalog_status':catalog_status,'committee':committee,'watchlist':observed,'feed':'Yahoo Finance (no oficial; datos potencialmente demorados)','cash_ars':as_float(p['cash_ars']),'cash_usd':as_float(p['cash_usd']),'initial_ars':as_float(p['initial_cash']),'autonomy_enabled':p['autonomy_enabled'],'trading_enabled':p['trading_enabled'],'allocations':[{ 'profile':x['profile'],'target_pct':as_float(x['target_pct'])} for x in allocations],'positions':out,'orders':[{'status':x['status'],'side':x['side'],'quantity':as_float(x['quantity']),'limit_price':as_float(x['limit_price']),'placed_at':x['placed_at'],'symbol':symbol_by_id.get(x['instrument_id'],'?')} for x in orders],'decisions':[{'action':x['action'],'rationale':x['rationale'],'decided_at':x['decided_at'],'symbol':symbol_by_id.get(x['instrument_id'],'?')} for x in last_decisions],'audit':[{'type':x['event_type'],'message':x['message'],'at':x['occurred_at']} for x in audit],'news':[{'title':x['title'],'url':x['article_url'],'publisher':x['publisher'],'country':x['country'],'sector':x['sector'],'published_at':x.get('published_at')} for x in news],'analyses':analyses,'warnings':logs,'note':'Cartera ficticia; informe públicamente visible si GitHub Pages es público. Los fills son estimaciones, no transacciones reales.'}
  target=ROOT/'docs'/'snapshot.json';target.parent.mkdir(parents=True,exist_ok=True)
  target.write_text(json.dumps(snapshot,ensure_ascii=False,indent=2),encoding='utf-8')
 

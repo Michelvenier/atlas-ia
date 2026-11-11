@@ -39,21 +39,23 @@ def selected_funds(doc,now):
         typ=str(x.get('tipo') or '').upper().strip()
         name=str(x.get('nombre') or '').strip()
         code=str(x.get('codigoCafci') or name).strip()
-        manager=str(x.get('gerente') or x.get('gestora') or '').strip()
+        manager=str(x.get('gerente') or x.get('gestora') or x.get('nombreBase') or name).strip()
         day=nav_date(x.get('fechaVcp'))
         price=finite(x.get('vcpHoy'))
         r30=finite(x.get('r30'))
         delta=finite(x.get('variacionDia'))
-        if not name or not code or typ!='MM' or currency not in ('ARS','PESOS','$','PESO ARGENTINO'):
+        if not name or not code or typ not in ('MM','MONEY MARKET','MONEYMARKET') or currency not in ('ARS','PESOS','$','PESO ARGENTINO','PESO','AR$'):
             continue
         if day is None or price is None or price<=0 or day>now.date() or (now.date()-day).days>5:
             continue
         if x.get('saltoPendiente') or (delta is not None and abs(delta)>2.0):continue
-        buy_eligible=(r30 is not None and 0<=r30<=20 and bool(manager))
+        # Un retorno r30 ausente no es evidencia de rendimiento positivo: requiere r7 corroborado.
+        r7=finite(x.get('r7'))
+        buy_eligible=(bool(manager) and ((r30 is not None and 0<=r30<=20) or (r30 is None and r7 is not None and 0<=r7<=6)))
         result.append({'symbol':code[:120],'name':name[:255], 'date':day,'nav':price,
-                       'r30':r30,'manager':manager,'buy_eligible':buy_eligible,'source':NAV_SOURCE,'kind':'suscripcion_cuotaparte'})
+                       'r30':r30,'r7':r7,'manager':manager,'buy_eligible':buy_eligible,'source':NAV_SOURCE,'kind':'suscripcion_cuotaparte'})
     # Pick different managers where possible; never decide from one return number alone.
-    return sorted(result,key=lambda a:(-(a['r30'] or 0),a['symbol']))
+    return sorted(result,key=lambda a:(not a['buy_eligible'],-(a['r30'] if a['r30'] is not None else (a['r7'] or 0)),a['symbol']))
 
 
 def nav_quote_timestamp(day):
