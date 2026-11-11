@@ -4,11 +4,13 @@ La compra usa un precio posterior a una orden, no el último precio al generarla
 Yahoo chart es fuente gratuita NO certificada; ejecuciones son estimaciones.
 """
 import os, json, time, math, statistics, datetime as dt, urllib.parse, xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 import requests
 import pandas as pd
 import exchange_calendars as xc
+from .research import dynamic_catalog, local_watch_catalog, decision_committee
 
 TZ=ZoneInfo('America/Argentina/Buenos_Aires'); UTC=dt.timezone.utc
 ROOT=Path(__file__).resolve().parents[1]
@@ -29,6 +31,28 @@ SLIPPAGE=0.002
 MAX_PER_EMITTER=0.08
 MAX_NEW_PER_RUN=1
 MAX_ORDER_BY_PROFILE={'moderado':300000,'agresivo':200000}
+# Instrumentos adicionales para OBSERVACIÓN. No autorizan compras nuevas.
+WATCH_ONLY={
+ 'BMA.BA':('Banco Macro','XBUE','ARS','finanzas'),
+ 'ALUA.BA':('Aluar','XBUE','ARS','industria'),
+ 'TXAR.BA':('Ternium Argentina','XBUE','ARS','industria'),
+ 'XOM.BA':('ExxonMobil CEDEAR','XBUE','ARS','petroleo'),
+ 'NVDA.BA':('Nvidia CEDEAR','XBUE','ARS','tecnologia'),
+ 'AMZN.BA':('Amazon CEDEAR','XBUE','ARS','tecnologia'),
+ 'SPY':('SPDR S&P 500 ETF','XNYS','USD','mercado_global'),
+ 'XLE':('Energy Select Sector ETF','XNYS','USD','petroleo'),
+ 'AAPL':('Apple EEUU','XNAS','USD','tecnologia'),
+ 'MSFT':('Microsoft EEUU','XNAS','USD','tecnologia'),
+ 'XOM':('ExxonMobil EEUU','XNYS','USD','petroleo'),
+}
+# Suplemento defensivo de feriados excepcionales ya confirmados, no sustituye un feed oficial.
+KNOWN_BYMA_CLOSED={'2026-11-09','2026-11-10'}
+# 11/11/2026: BYMA negocia con reglas especiales de liquidación.
+# ATLAS no modela T+1 para CEDEAR: no los ejecuta ese día.
+SPECIAL_CEDEAR_T1_ONLY={'2026-11-11'}
+LOCAL_SESSION_START=dt.time(10,30)
+LOCAL_SESSION_END=dt.time(18,0)
+
 
 
 def iso_now():return dt.datetime.now(UTC).isoformat()
@@ -84,10 +108,24 @@ def analysis(points):
 
 
 def session_open(now):
+ """Validación restrictiva; no representa permisos de cada plazo de liquidación."""
+ local=now.astimezone(TZ)
+ day=local.date().isoformat()
+ if local.weekday()>=5 or day in KNOWN_BYMA_CLOSED:return False
+ if day in SPECIAL_CEDEAR_T1_ONLY:
+  # Apertura local confirmada pero con restricciones: validación horaria adicional.
+  return LOCAL_SESSION_START<=local.time().replace(tzinfo=None)<LOCAL_SESSION_END
  try:
   cal=xc.get_calendar('XBUE')
   return bool(cal.is_open_on_minute(pd.Timestamp(now).floor('min')))
  except Exception:return False
+
+def instrument_session_allowed(symbol,now):
+ """No asumir que un CEDEAR T+0 se puede operar en una rueda T+1."""
+ if not session_open(now):return False,'MERCADO_CERRADO'
+ if now.astimezone(TZ).date().isoformat() in SPECIAL_CEDEAR_T1_ONLY and symbol.endswith('.BA') and symbol in {s for s,(n,t,p,v) in UNIVERSE.items() if t=='cedear'}:
+  return False,'CEDEAR_T1_SIN_SIMULADOR_DE_LIQUIDACION'
+ return True,'SESION_ADMITIDA'
 
 def valid_intraday_quote(q,now):
  if not q:return False,'SIN_PRECIO'
@@ -95,22 +133,68 @@ def valid_intraday_quote(q,now):
  age=(now-t).total_seconds()
  if not (0<=age<=QUOTE_MAX_AGE_S):return False,'PRECIO_ANTIGUO'
  try:
-  cal=xc.get_calendar('XBUE')
-  if not cal.is_open_on_minute(pd.Timestamp(t).floor('min')):return False,'COTIZACION_FUERA_DE_RUEDA'
+  if now.astimezone(TZ).date().isoformat() in SPECIAL_CEDEAR_T1_ONLY:
+   local_tick=t.astimezone(TZ)
+   if local_tick.date()!=now.astimezone(TZ).date() or not (LOCAL_SESSION_START<=local_tick.time()<LOCAL_SESSION_END):
+    return False,'COTIZACION_FUERA_DE_RUEDA'
+  else:
+   cal=xc.get_calendar('XBUE')
+   if not cal.is_open_on_minute(pd.Timestamp(t).floor('min')):return False,'COTIZACION_FUERA_DE_RUEDA'
  except Exception:return False,'CALENDARIO_NO_DISPONIBLE'
  return True,'VALIDO_CON_DEMORA_POTENCIAL'
 
 
-def news_feed():
- url='https://news.google.com/rss/search?'+urllib.parse.urlencode({'q':'economía Argentina petróleo política mercados bolsa cuando:1d','hl':'es-419','gl':'AR','ceid':'AR:es-419'})
- r=requests.get(url,timeout=15,headers={'User-Agent':'Mozilla/5.0'});r.raise_for_status()
- root=ET.fromstring(r.content)
- out=[]
- for n in root.findall('.//item')[:12]:
-  link=n.findtext('link') or ''
-  if not link.startswith('https://'):continue
-  out.append({'title':(n.findtext('title') or '')[:500],'article_url':link,'publisher':n.findtext('source') or 'Google News','summary':'Titular de agregador; no se usó para determinar compras','country':'Argentina','sector':'economía','metadata':{'source':'Google News RSS'}})
- return out
+NEWS_TOPICS=[
+ ('Argentina','macroeconomia','Argentina inflación BCRA tasa política monetaria dólar MEP reservas'),
+ ('Argentina','politica','Argentina congreso ejecutivo presupuesto impuestos regulación economía'),
+ ('Argentina','deuda','Argentina bonos deuda soberana AL30 GD30 licitación letras tesoro'),
+ ('Argentina','obligaciones negociables','obligaciones negociables emisiones CNV vencimientos empresas argentina'),
+ ('Argentina','fondos','fondos comunes inversión CAFCI rescates cuotapartes argentina'),
+ ('Argentina','energia','YPF Vaca Muerta petróleo gas energía Argentina'),
+ ('Argentina','bancos','bancos argentina balances riesgo crediticio liquidez'),
+ ('Argentina','agro','argentina soja maíz trigo exportaciones retenciones'),
+ ('Estados Unidos','monetaria','Federal Reserve rates inflation CPI employment Treasury'),
+ ('Estados Unidos','empresas','US corporate earnings guidance quarterly filings SEC'),
+ ('Estados Unidos','tecnologia','Nvidia Microsoft Apple Amazon artificial intelligence earnings'),
+ ('Estados Unidos','energia','US crude oil gas inventories shale energy companies'),
+ ('Estados Unidos','bonos','US treasury yields bonds yield curve credit spreads'),
+ ('Global','petroleo','Brent WTI oil OPEC supply production geopolitics'),
+ ('Global','gas','natural gas LNG exports global energy prices'),
+ ('Global','tecnologia','semiconductors chip manufacturing Nvidia TSMC ASML'),
+ ('Global','finanzas','global stocks equity market volatility risk credit'),
+ ('Global','geopolitica','trade sanctions conflicts tariffs shipping energy risk'),
+ ('China','economia','China property stimulus industrial production consumption demand'),
+ ('Brasil','economia','Brasil Selic fiscal real bolsa Petrobras Vale'),
+ ('Europa','macroeconomia','European Central Bank inflation rates eurozone'),
+ ('Europa','energia','Europe natural gas electricity energy prices'),
+ ('Medio Oriente','petroleo','Middle East oil supply OPEC crude geopolitical risk'),
+ ('India','economia','India economy growth monetary policy energy demand'),
+ ('Global','metales','copper gold lithium mining commodity prices'),
+ ('Global','salud','healthcare pharma companies earnings drugs regulation'),
+]
+
+def news_feed(now):
+ # Rotación de temas a lo largo del día. Recoge noticias aunque BYMA no tenga rueda.
+ # No se utilizan titulares como reglas automáticas de compra/venta.
+ slot=(now.astimezone(TZ).hour*4+now.minute//15)%len(NEWS_TOPICS)
+ major=now.astimezone(TZ).hour in (8,12,17,19) and now.astimezone(TZ).minute<40
+ topics=[NEWS_TOPICS[(slot+i*5)%len(NEWS_TOPICS)] for i in range(5 if major else 2)]
+ out=[];seen=set();errors=[]
+ for country,sector,query in topics:
+  try:
+   url='https://news.google.com/rss/search?'+urllib.parse.urlencode({'q':query+' when:2d','hl':'es-419','gl':'AR','ceid':'AR:es-419'})
+   r=requests.get(url,timeout=15,headers={'User-Agent':'Mozilla/5.0'});r.raise_for_status()
+   root=ET.fromstring(r.content)
+   for n in root.findall('.//item')[:12]:
+    link=n.findtext('link') or ''
+    if not link.startswith('https://') or link in seen:continue
+    seen.add(link)
+    date_str=n.findtext('pubDate') or ''
+    try:pub=parsedate_to_datetime(date_str).astimezone(UTC).isoformat()
+    except Exception:pub=now.isoformat()
+    out.append({'title':(n.findtext('title') or '')[:500], 'article_url':link,'publisher':n.findtext('source') or 'Google News', 'published_at':pub,'summary':'Titular recogido automáticamente; contenido no verificado. No utilizado como señal de compra.','country':country,'sector':sector,'metadata':{'source':'Google News RSS','query':query,'retrieved_at':now.isoformat()}})
+  except Exception as e:errors.append(f'{country}/{sector}: {str(e)[:90]}')
+ return out,errors
 
 
 def position_map(db,pid):
@@ -128,7 +212,8 @@ def fill_pending(db,pid,now,latest):
   try:
    ins=db.get('atlas_instruments',id='eq.'+order['instrument_id'])[0]
    sym=ins['symbol'];q=latest.get(sym)
-   if not session_open(now):continue
+   allowed,session_reason=instrument_session_allowed(sym,now)
+   if not allowed:continue
    ok,why=valid_intraday_quote(q,now)
    if not ok:continue
    quote_time,price=q[-1]
@@ -167,8 +252,7 @@ def run():
  logs=[];quotes={};analyses=[]
  market_open=session_open(now)
  # Exclusión temporal defensiva de acontecimientos extraordinarios conocidos.
- known_closed={'2026-11-09','2026-11-10'}
- if local.date().isoformat() in known_closed:market_open=False
+ if local.date().isoformat() in KNOWN_BYMA_CLOSED:market_open=False
  for symbol,(name,typ,profile,vol_limit) in UNIVERSE.items():
   try:
    points=fetch_chart(symbol,'1d','6mo');metrics=analysis(points)
@@ -180,12 +264,48 @@ def run():
   except Exception as ex:logs.append({'symbol':symbol,'error':'Histórico: '+str(ex)[:110]})
   try:quotes[symbol]=fetch_chart(symbol,'1m','1d')
   except Exception as ex:logs.append({'symbol':symbol,'error':'Intradiario: '+str(ex)[:110]})
- if local.hour in (8,10,19):
+ # Noticias: en todos los ciclos, también con el mercado argentino cerrado.
+ news_count=0
+ try:
+  items,news_errors=news_feed(now)
+  for n in items:
+   try:
+    db.upsert('atlas_news',[n],'article_url');news_count+=1
+   except Exception as ex:
+    logs.append({'news_save_error':str(ex)[:110]})
+  for err in news_errors:logs.append({'news_fetch_error':err})
+ except Exception as ex:logs.append({'news_error':str(ex)[:120]})
+ # El catálogo amplio es investigativo. Nada de estos activos se vuelve operable automáticamente.
+ catalog_status=[]
+ broad_catalog=local_watch_catalog()
+ try:
+  additions,catalog_status=dynamic_catalog()
+  broad_catalog.extend(additions)
+ except Exception as exc:
+  catalog_status=[{'source':'catalogo','status':'ERROR','message':str(exc)[:180]}]
+ # Índice único por tipo+símbolo para el buscador; no inventamos cotizaciones.
+ unique_catalog={}
+ for item in broad_catalog:
+  unique_catalog[(item['category'],item['symbol'])]=item
+ broad_catalog=list(unique_catalog.values())
+ # Análisis de seguimiento adicional: no interviene en las órdenes.
+ observed=[]
+ for symbol,(name,exchange,currency,sector) in WATCH_ONLY.items():
   try:
-   for n in news_feed():
-    try:db.upsert('atlas_news',[n],'article_url')
-    except Exception:pass
-  except Exception as ex:logs.append({'news_error':str(ex)[:100]})
+   m=analysis(fetch_chart(symbol,'1d','6mo'))
+   observed.append({'symbol':symbol,'name':name,'market':exchange,'currency':currency,'sector':sector,'metrics':m,'trade_allowed':False})
+  except Exception as ex:logs.append({'watch_symbol':symbol,'error':str(ex)[:100]})
+
+ committee=[decision_committee(a['symbol'],a['profile'],a['metrics'],news_count=news_count) for a in analyses]
+ # Guardar disenso entre especialidades sin atribuirlo a agentes de IA inexistentes.
+ for c in committee:
+  try:
+   ins=db.get('atlas_instruments',symbol='eq.'+c['symbol'],exchange='eq.XBUE')
+   if ins:db.insert('atlas_analyses',{'instrument_id':ins[0]['id'],'profile':c['profile'],
+    'specialist':'COMITE_EXPLICABLE_V2','thesis':f"Técnico: {c['technical']['view']}. Fundamental: {c['fundamental']['view']}. Macropolítica: {c['macro_politics']['view']}. Riesgo: {c['risk']['view']}.",
+    'opinion':'esperar','confidence':None,'evidence':[c],
+    'limitations':c['limitation'],'model_version':'atlas_explainable_2'})
+  except Exception as exc:logs.append({'committee':c['symbol'],'error':str(exc)[:100]})
  if market_open:
   fill_pending(db,pid,now,quotes)
   port=db.get('atlas_portfolios',code='eq.'+CODE)[0]
@@ -201,6 +321,8 @@ def run():
      if not pos or as_float(pos['quantity'])<=0:continue
      ok,why=valid_intraday_quote(quotes.get(sym),now)
      if not ok:continue
+     allowed,_=instrument_session_allowed(sym,now)
+     if not allowed:continue
      price=quotes[sym][-1][1];cost=as_float(pos['average_cost'])
      if cost<=0:continue
      change=price/cost-1
@@ -215,6 +337,8 @@ def run():
       if not ins:continue
       q=quotes.get(sym);ok,why=valid_intraday_quote(q,now)
       if not ok:continue
+      allowed,_=instrument_session_allowed(sym,now)
+      if not allowed:continue
       score=a['metrics']['score'];rsi=a['metrics']['rsi'];vol=a['metrics']['vol']
       if score<BUY_SCORE or not 38<=rsi<=66 or vol>UNIVERSE[sym][3]:continue
       if (ins['id'],p) in positions and as_float(positions[(ins['id'],p)]['quantity'])>0:continue
@@ -230,13 +354,13 @@ def run():
  for item in logs[:12]:
   try:record_event(db,pid,'DATA_WARNING',json.dumps(item,ensure_ascii=False))
   except Exception:pass
- export_snapshot(db,now,market_open,logs,analyses,quotes)
+ export_snapshot(db,now,market_open,logs,analyses,quotes,observed,news_count,broad_catalog,catalog_status,committee)
  jobs=db.get('atlas_job_runs',job_name='eq.atlas_cloud_cycle',order='id.desc',limit='1')
- if jobs:db.patch('atlas_job_runs',{'id':'eq.'+str(jobs[0]['id'])},{'finished_at':iso_now(),'status':'SUCCESS','details':{'market_open':market_open,'warnings':len(logs)}})
- print(json.dumps({'market_open':market_open,'analyses':len(analyses),'warnings':len(logs)},ensure_ascii=False))
+ if jobs:db.patch('atlas_job_runs',{'id':'eq.'+str(jobs[0]['id'])},{'finished_at':iso_now(),'status':'SUCCESS','details':{'market_open':market_open,'warnings':len(logs),'news_refreshed':news_count,'watch_count':len(observed),'catalog_count':len(broad_catalog)}})
+ print(json.dumps({'byma_open':market_open,'local_tradable_analyses':len(analyses),'global_watch_analyses':len(observed),'news_refreshed':news_count,'catalog_count':len(broad_catalog),'warnings':len(logs)},ensure_ascii=False))
 
 
-def export_snapshot(db,now,market_open,logs,analyses,quotes):
+def export_snapshot(db,now,market_open,logs,analyses,quotes,observed,news_count,broad_catalog,catalog_status,committee):
  p=db.get('atlas_portfolios',code='eq.'+CODE)[0];pid=p['id']
  positions=db.get('atlas_positions',portfolio_id='eq.'+pid)
  instruments=db.get('atlas_instruments')
@@ -248,10 +372,10 @@ def export_snapshot(db,now,market_open,logs,analyses,quotes):
   out.append({'symbol':symbol,'profile':pos['profile'],'quantity':as_float(pos['quantity']),'average_cost':as_float(pos['average_cost']),'mark':q[-1][1] if q else None,'currency':'ARS','realized_pnl':as_float(pos['realized_pnl'])})
  orders=db.get('atlas_orders',portfolio_id='eq.'+pid,order='placed_at.desc',limit='30')
  audit=db.get('atlas_audit_events',portfolio_id='eq.'+pid,order='occurred_at.desc',limit='40')
- news=db.get('atlas_news',order='published_at.desc',limit='30')
+ news=db.get('atlas_news',order='published_at.desc',limit='300')
  allocations=db.get('atlas_allocations',portfolio_id='eq.'+pid)
  last_decisions=db.get('atlas_decisions',portfolio_id='eq.'+pid,order='decided_at.desc',limit='30')
- snapshot={'as_of':iso_now(),'market_open':market_open,'feed':'Yahoo Finance (no oficial; datos potencialmente demorados)','cash_ars':as_float(p['cash_ars']),'cash_usd':as_float(p['cash_usd']),'initial_ars':as_float(p['initial_cash']),'autonomy_enabled':p['autonomy_enabled'],'trading_enabled':p['trading_enabled'],'allocations':[{ 'profile':x['profile'],'target_pct':as_float(x['target_pct'])} for x in allocations],'positions':out,'orders':[{'status':x['status'],'side':x['side'],'quantity':as_float(x['quantity']),'limit_price':as_float(x['limit_price']),'placed_at':x['placed_at'],'symbol':symbol_by_id.get(x['instrument_id'],'?')} for x in orders],'decisions':[{'action':x['action'],'rationale':x['rationale'],'decided_at':x['decided_at'],'symbol':symbol_by_id.get(x['instrument_id'],'?')} for x in last_decisions],'audit':[{'type':x['event_type'],'message':x['message'],'at':x['occurred_at']} for x in audit],'news':[{'title':x['title'],'url':x['article_url'],'publisher':x['publisher'],'country':x['country'],'sector':x['sector']} for x in news],'analyses':analyses,'warnings':logs,'note':'Cartera ficticia; informe públicamente visible si GitHub Pages es público. Los fills son estimaciones, no transacciones reales.'}
+ snapshot={'as_of':iso_now(),'market_open':market_open,'market_detail':{'XBUE':{'open':market_open,'local_time':now.astimezone(TZ).isoformat(),'reason':('Feriado confirmado en BYMA' if now.astimezone(TZ).date().isoformat() in KNOWN_BYMA_CLOSED else '11/11: rueda excepcional; CEDEAR T+1 no simulado, órdenes CEDEAR bloqueadas' if now.astimezone(TZ).date().isoformat() in SPECIAL_CEDEAR_T1_ONLY else 'Calendario local exchange_calendars; restricciones extraordinarias NO garantizadas'),'source':'exchange_calendars + excepciones fechadas'},'US':{'open':None,'reason':'Seguimiento de precios únicamente; no se verifica sesión para negociación automática'}},'news_fetched_this_cycle':news_count,'cycle_kind':('PREAPERTURA' if now.astimezone(TZ).time().hour<10 else 'CIERRE' if now.astimezone(TZ).time().hour>=18 else 'MONITOREO'), 'execution_policy':'No se completa una orden sin precio intradiario posterior; CEDEAR 11/11 T+1 bloqueado si no se modela liquidación','instrument_catalog':broad_catalog,'catalog_status':catalog_status,'committee':committee,'watchlist':observed,'feed':'Yahoo Finance (no oficial; datos potencialmente demorados)','cash_ars':as_float(p['cash_ars']),'cash_usd':as_float(p['cash_usd']),'initial_ars':as_float(p['initial_cash']),'autonomy_enabled':p['autonomy_enabled'],'trading_enabled':p['trading_enabled'],'allocations':[{ 'profile':x['profile'],'target_pct':as_float(x['target_pct'])} for x in allocations],'positions':out,'orders':[{'status':x['status'],'side':x['side'],'quantity':as_float(x['quantity']),'limit_price':as_float(x['limit_price']),'placed_at':x['placed_at'],'symbol':symbol_by_id.get(x['instrument_id'],'?')} for x in orders],'decisions':[{'action':x['action'],'rationale':x['rationale'],'decided_at':x['decided_at'],'symbol':symbol_by_id.get(x['instrument_id'],'?')} for x in last_decisions],'audit':[{'type':x['event_type'],'message':x['message'],'at':x['occurred_at']} for x in audit],'news':[{'title':x['title'],'url':x['article_url'],'publisher':x['publisher'],'country':x['country'],'sector':x['sector'],'published_at':x.get('published_at')} for x in news],'analyses':analyses,'warnings':logs,'note':'Cartera ficticia; informe públicamente visible si GitHub Pages es público. Los fills son estimaciones, no transacciones reales.'}
  target=ROOT/'docs'/'snapshot.json';target.parent.mkdir(parents=True,exist_ok=True)
  target.write_text(json.dumps(snapshot,ensure_ascii=False,indent=2),encoding='utf-8')
 
